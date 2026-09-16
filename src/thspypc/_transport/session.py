@@ -30,6 +30,9 @@ class MarketSession:
         self._socket_getter = socket_getter
         self._request_lock = request_lock
         self._timing_name = timing_name
+        # 最近一次业务发送（request/request_latest）时刻；try_send 的保活
+        # 帧不刷新它——保活线程据此区分“业务自己在跑”与“通道纯空闲”。
+        self.last_request = time.monotonic()
         self._dispatcher = ResponseDispatcher(socket_getter)
         self._gate_lock = threading.Lock()
         self._latest_gate = 0
@@ -83,6 +86,7 @@ class MarketSession:
                 self._remaining(deadline, phase="starting socket request")
             )
             sock.sendall(frame + (b"\n" if trailing_newline else b""))
+            self.last_request = time.monotonic()
             yield sock
         finally:
             add_request_timing(
@@ -131,6 +135,7 @@ class MarketSession:
                 self._remaining(deadline, phase="starting latest request")
             )
             sock.sendall(frame + (b"\n" if trailing_newline else b""))
+            self.last_request = time.monotonic()
             yield sock
         finally:
             add_request_timing(

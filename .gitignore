@@ -41,3 +41,6 @@ tests/credentials*.json
 # 本地 dev 日志（dev.sh 之外的调试运行）
 .dev-backend.log
 .dev-frontend.log
+
+# dev.sh/诊断后台运行的日志与抓取样本
+.dev-logs/

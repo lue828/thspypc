@@ -127,6 +127,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self.imei = self.imei if self.imei is not None else generate_imei()
         self.mac64 = mac64 if mac64 is not None else generate_mac64()
         self.enable_heartbeat = enable_heartbeat
+        # 板块通道注册保活线程（_start_heartbeat 里懒创建；enable_heartbeat
+        # 为 False 的离线测试永远不会启动它）
+        self._board_keepalive = None
         self._sock: socket.socket | None = None
         self._auth: dict | None = None
         self._auth_service = AuthService(
@@ -1446,11 +1449,27 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
         8901 每 3 秒、9601 每 30 秒（若已连接）。daemon 线程，主进程退出时自动结束。
         enable_heartbeat=False 时不启动（用于对比测试）。
+
+        同时启动板块通道保活线程（见
+        :class:`thspypc._client.board_keepalive.BoardChannelKeepalive`）：
+        板块/成分股通道没有协议心跳（2026-09-16 抓包确认），真实客户端靠
+        94 页面持续的注册流量保温；我们复刻该形态——空闲补注册帧、长期
+        空闲主动拆除。
         """
+        if self.enable_heartbeat:
+            if self._board_keepalive is None:
+                from ._client.board_keepalive import BoardChannelKeepalive
+
+                self._board_keepalive = BoardChannelKeepalive(
+                    lambda: self._service_connections
+                )
+            self._board_keepalive.start()
         self._connection_runtime.start_heartbeat()
 
     def stop_heartbeat(self) -> None:
         """停止心跳线程（disconnect 时自动调用）。"""
+        if self._board_keepalive is not None:
+            self._board_keepalive.stop()
         self._connection_runtime.stop_heartbeat()
 
     # ── 实时分时推送（pageid=5716 多股订阅触发，2026-07-24 抓包破解）──
@@ -1518,6 +1537,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         长连接反复查询，避免反复 disconnect/connect 触发 VerifyCode=-1
         （同账号同 IP 短时间重复 login 的会话冲突，见 docs/handoffs/HANDOFF.md §7）。
         """
+        if self._board_keepalive is not None:
+            self._board_keepalive.stop()
         self._connection_runtime.disconnect()
 
     def _close_owned_sockets(self) -> None:

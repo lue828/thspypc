@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
@@ -210,6 +211,15 @@ class ManagedConnection:
     @property
     def socket(self) -> CloseableSocket | None:
         return self._socket
+
+    @property
+    def idle_seconds(self) -> float:
+        """距最近一次业务发送的秒数（板块通道保活线程的空闲判据）。
+
+        以 :class:`MarketSession.last_request` 为准：保活线程自己的注册帧
+        （try_send）不刷新它，通道“纯空闲”时该值持续增长。
+        """
+        return time.monotonic() - self._session.last_request
 
     @property
     def owns_socket(self) -> bool:
