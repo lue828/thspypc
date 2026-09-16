@@ -3071,6 +3071,7 @@ class ServiceFacade:
                 timeout=timeout,
             ),
         )
+        records = self._backfill_constituent_gaps(stock_codes, records)
         # 通道的 dt66 涨幅收盘后为 0/盘中滞后（2026-09-09 实测），但 dt10/dt6
         # 现价昨收可靠：本地补算 chg_pct，前端列表到达即完整可排序，
         # 不必再等 quotes_ext 二跳（对齐真实客户端“一次肥查询带全列”）。
@@ -3079,6 +3080,67 @@ class ServiceFacade:
             price = row.get("dt10")
             if prev and price:
                 row["chg_pct"] = (price / prev - 1) * 100
+        return records
+
+    # 单股补齐上限：防一条僵死板块通道掉一大片成分时，把板块查询退化成
+    # 逐股 MAIN 查询风暴。正常场景只有 <3 只的小市场组走补齐（1~2 只）。
+    _CONSTITUENT_BACKFILL_MAX = 8
+
+    def _backfill_constituent_gaps(
+        self,
+        stock_codes: list[str],
+        records: list[dict],
+    ) -> list[dict]:
+        """板块通道没返回的成分股，用 MAIN 单股列表行情补齐。
+
+        服务端对 <3 只的市场组不回 0x64 表（见
+        ``BoardService.L2_MIN_GROUP_SIZE``），这些代码在板块通道上等满
+        超时也等不到；改走 MAIN 的 :meth:`stock_quote_fields`（hd1.0/hd3.1
+        明文表，市场按代码前缀路由），映射回成分股行的 dt 键约定。
+        补齐失败只记日志，不影响板块通道已返回的行。
+        """
+        have = {str(row.get("code", "")) for row in records}
+        missing = [code for code in stock_codes if code not in have]
+        if not missing:
+            return records
+        if len(missing) > self._CONSTITUENT_BACKFILL_MAX:
+            logger.info(
+                "board_constituents: %d 只未返回，超过单股补齐上限 %d，跳过",
+                len(missing), self._CONSTITUENT_BACKFILL_MAX,
+            )
+            return records
+        try:
+            quotes = self.stock_quote_fields(missing, timeout=8.0)
+        except Exception as exc:  # noqa: BLE001 - 补齐是尽力而为
+            logger.warning(
+                "board_constituents: 单股补齐失败（%d 只）: %s",
+                len(missing), exc,
+            )
+            return records
+        still_missing = set(missing)
+        for quote in quotes:
+            code = str(quote.get("code", ""))
+            if code not in still_missing:
+                continue
+            still_missing.discard(code)
+            # dt 键对齐板块通道行：dt10 现价 / dt19 成交额 / dt48 四分钟
+            # 涨速；chg_pct 由 derive_list_quote_fields 直接给出（无 dt6
+            # 映射，末尾的本地补算不会覆盖它）。
+            row: dict = {"code": code}
+            if quote.get("price") is not None:
+                row["dt10"] = quote["price"]
+            if quote.get("amount") is not None:
+                row["dt19"] = quote["amount"]
+            if quote.get("speed_4m") is not None:
+                row["dt48"] = quote["speed_4m"]
+            if quote.get("chg_pct") is not None:
+                row["chg_pct"] = quote["chg_pct"]
+            records.append(row)
+        if still_missing:
+            logger.info(
+                "board_constituents: 单股补齐后仍缺 %d 只: %s",
+                len(still_missing), sorted(still_missing)[:5],
+            )
         return records
 
     # 桥接仅限 A 股类别：美股/港股/ETF 等本地同名板块（如“港口航运[US]”）

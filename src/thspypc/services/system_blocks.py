@@ -624,6 +624,11 @@ class BoardService:
     ``_open_board_channel`` 负责，本服务经 ``ConnectionRole.BOARD`` 取通道。
     """
 
+    # L2 沪/深市场分组查询的最小规模：小于该值的服务端不回 0x64 行情表
+    # （2026-09-16 实测 2 只只回 0x4a 统计表 + 逐股快照推送帧），直接
+    # 跳过、由门面走单股行情补齐。
+    L2_MIN_GROUP_SIZE = 3
+
     def __init__(
         self,
         connections: ConnectionManager,
@@ -1172,7 +1177,18 @@ class BoardService:
         stock_markets: dict[str, int | str] | None = None,
         timeout: float = 40.0,
     ) -> list[dict]:
-        """对已展开的成分股代码批量查询行情（0x64 表）。"""
+        """对已展开的成分股代码批量查询行情（0x64 表）。
+
+        L2 分组行为（2026-09-16 血氧仪 886028 实测）：
+
+        - 每个市场组独立分配 ``timeout / 组数`` 的预算。共享一个 deadline
+          时，不应答的组会吃光全部预算，让另一组 ``remaining<=0`` 直接
+          饿死（当时 2 只的沪组烧满 45s，22 只深组从未执行）。
+        - 小于 3 只的市场组直接跳过：shlv2 网关对极小分组不回 0x64 行情
+          表，只回 0x4a 统计表 + 逐股快照推送帧（无 hd1.0/hd3.1 可解析
+          表），等满超时也等不到。跳过的小组由门面
+          :meth:`THSClient.board_constituents` 走 MAIN 单股行情补齐。
+        """
         records: list[dict] = []
         returned_codes: set[str] = set()
         deadline = time.monotonic() + timeout
@@ -1192,10 +1208,22 @@ class BoardService:
                     or code.startswith(("0", "1", "2", "3"))
                 ],
             )
+            queryable = [
+                batch for batch in groups
+                if len(batch) >= self.L2_MIN_GROUP_SIZE
+            ]
+            group_budget = timeout / max(1, len(queryable))
             for group_index, batch in enumerate(groups):
                 if not batch:
                     continue
-                remaining = deadline - time.monotonic()
+                if len(batch) < self.L2_MIN_GROUP_SIZE:
+                    logger.info(
+                        "board_constituents: 市场组仅 %d 只，服务端不回"
+                        " 0x64 表，跳过（由门面单股行情补齐）: %s",
+                        len(batch), batch[:3],
+                    )
+                    continue
+                remaining = min(deadline - time.monotonic(), group_budget)
                 if remaining <= 0:
                     break
                 request = build_board_constituents_query(
